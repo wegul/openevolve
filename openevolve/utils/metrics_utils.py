@@ -85,6 +85,7 @@ def get_fitness_score(
     Returns:
         Fitness score (combined_score if available, otherwise average of non-feature metrics)
     """
+    metrics = {key: value for key, value in (metrics or {}).items() if key != "eval_time"}
     if not metrics:
         return 0.0
 

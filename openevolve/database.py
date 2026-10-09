@@ -10,14 +10,13 @@ import os
 import random
 import shutil
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from numbers import Integral
 from types import MappingProxyType
 
 # FileLock removed - no longer needed with threaded parallel processing
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -186,6 +185,8 @@ class ProgramDatabase:
         # Track the last iteration number (for resuming)
         self.last_iteration: int = 0
 
+        self.copy_count = 0
+
         # Load database from disk if path is provided
         if config.db_path and os.path.exists(config.db_path):
             self.load(config.db_path)
@@ -235,6 +236,21 @@ class ProgramDatabase:
             else None
         )
         self.similarity_threshold = config.similarity_threshold
+
+    def _ordered_ids(self, ids: Iterable[str]) -> List[str]:
+        """Order candidates before sampling; set layout is not a random choice."""
+        return sorted(
+            ids,
+            key=lambda pid: (
+                self.programs[pid].iteration_found if pid in self.programs else -1, pid
+            ),
+        )
+
+    def _copy_id(self) -> str:
+        self.copy_count += 1
+        while f"copy-{self.copy_count}" in self.programs:
+            self.copy_count += 1
+        return f"copy-{self.copy_count}"
 
     @staticmethod
     def _program_state(program: Program) -> ProgramState:
@@ -563,7 +579,7 @@ class ProgramDatabase:
         island_id = island_id % len(self.islands)
 
         # Get programs from the specific island
-        island_programs = list(self.islands[island_id])
+        island_programs = self._ordered_ids(self.islands[island_id])
 
         if not island_programs:
             # Island is empty, fall back to sampling from all programs
@@ -694,7 +710,9 @@ class ProgramDatabase:
         if island_idx is not None:
             # Island-specific query
             island_programs = [
-                self.programs[pid] for pid in self.islands[island_idx] if pid in self.programs
+                self.programs[pid]
+                for pid in self._ordered_ids(self.islands[island_idx])
+                if pid in self.programs
             ]
             candidates = island_programs
         else:
@@ -757,14 +775,15 @@ class ProgramDatabase:
         # Save metadata
         metadata = {
             "island_feature_maps": self.island_feature_maps,
-            "islands": [list(island) for island in self.islands],
-            "archive": list(self.archive),
+            "islands": [self._ordered_ids(island) for island in self.islands],
+            "archive": self._ordered_ids(self.archive),
             "best_program_id": self.best_program_id,
             "island_best_programs": self.island_best_programs,
             "last_iteration": iteration or self.last_iteration,
             "current_island": self.current_island,
             "island_generations": self.island_generations,
             "last_migration_generation": self.last_migration_generation,
+            "copy_count": self.copy_count,
             "feature_stats": self._serialize_feature_stats(),
         }
 
@@ -800,6 +819,7 @@ class ProgramDatabase:
             self.island_best_programs = metadata.get(
                 "island_best_programs", [None] * len(saved_islands)
             )
+            self.copy_count = metadata.get("copy_count", 0)
             self.last_iteration = metadata.get("last_iteration", 0)
             self.current_island = metadata.get("current_island", 0)
             self.island_generations = metadata.get("island_generations", [0] * len(saved_islands))
@@ -1221,7 +1241,7 @@ class ProgramDatabase:
         max_smlty = float("-inf")
         max_smlty_pid = None
 
-        for pid in self.islands[island_idx]:
+        for pid in self._ordered_ids(self.islands[island_idx]):
             other = self.programs[pid]
 
             if other.embedding is None:
@@ -1316,7 +1336,7 @@ class ProgramDatabase:
         valid_archive_programs = []
         stale_ids = []
 
-        for pid in self.archive:
+        for pid in self._ordered_ids(self.archive):
             if pid in self.programs:
                 valid_archive_programs.append(self.programs[pid])
             else:
@@ -1471,7 +1491,7 @@ class ProgramDatabase:
             if best_program:
                 # Create a copy of best program for the empty island (don't reuse same ID)
                 copy_program = Program(
-                    id=str(uuid.uuid4()),
+                    id=self._copy_id(),
                     code=best_program.code,
                     changes_description=best_program.changes_description,
                     language=best_program.language,
@@ -1497,7 +1517,9 @@ class ProgramDatabase:
                 return next(iter(self.programs.values()))
 
         # Clean up stale references and sample from current island
-        valid_programs = [pid for pid in current_island_programs if pid in self.programs]
+        valid_programs = [
+            pid for pid in self._ordered_ids(current_island_programs) if pid in self.programs
+        ]
 
         # Remove stale program IDs from island
         if len(valid_programs) < len(current_island_programs):
@@ -1517,7 +1539,7 @@ class ProgramDatabase:
             if best_program:
                 # Create a copy of best program for the empty island (don't reuse same ID)
                 copy_program = Program(
-                    id=str(uuid.uuid4()),
+                    id=self._copy_id(),
                     code=best_program.code,
                     changes_description=best_program.changes_description,
                     language=best_program.language,
@@ -1554,7 +1576,7 @@ class ProgramDatabase:
             return self._sample_exploration_parent()
 
         # Clean up stale references in archive
-        valid_archive = [pid for pid in self.archive if pid in self.programs]
+        valid_archive = [pid for pid in self._ordered_ids(self.archive) if pid in self.programs]
 
         # Remove stale program IDs from archive
         if len(valid_archive) < len(self.archive):
@@ -1593,7 +1615,7 @@ class ProgramDatabase:
             raise ValueError("No programs available for sampling")
 
         # Sample randomly from all programs
-        program_id = random.choice(list(self.programs.keys()))
+        program_id = random.choice(self._ordered_ids(self.programs))
         return self.programs[program_id]
 
     def _sample_from_island_weighted(self, island_id: int) -> Program:
@@ -1607,7 +1629,7 @@ class ProgramDatabase:
             Parent program selected using fitness-weighted sampling
         """
         island_id = island_id % len(self.islands)
-        island_programs = list(self.islands[island_id])
+        island_programs = self._ordered_ids(self.islands[island_id])
 
         if not island_programs:
             # Island is empty, fall back to any available program
@@ -1664,7 +1686,7 @@ class ProgramDatabase:
             Parent program selected uniformly at random
         """
         island_id = island_id % len(self.islands)
-        island_programs = list(self.islands[island_id])
+        island_programs = self._ordered_ids(self.islands[island_id])
 
         if not island_programs:
             # Island is empty, fall back to any available program
@@ -1700,7 +1722,7 @@ class ProgramDatabase:
             return self._sample_from_island_weighted(island_id)
 
         # Clean up stale references in archive
-        valid_archive = [pid for pid in self.archive if pid in self.programs]
+        valid_archive = [pid for pid in self._ordered_ids(self.archive) if pid in self.programs]
 
         if not valid_archive:
             logger.warning(
@@ -1754,7 +1776,7 @@ class ProgramDatabase:
         parent_island %= len(self.islands)
 
         # Get all programs from the current island
-        island_program_ids = list(self.islands[parent_island])
+        island_program_ids = self._ordered_ids(self.islands[parent_island])
         island_programs = [self.programs[pid] for pid in island_program_ids if pid in self.programs]
 
         if not island_programs:
@@ -2107,18 +2129,20 @@ class ProgramDatabase:
         if migrant is None or migrant.metadata.get("migrant", False):
             return
         target_island_programs = [
-            self.programs[pid] for pid in self.islands[target_island] if pid in self.programs
+            self.programs[pid]
+            for pid in self._ordered_ids(self.islands[target_island])
+            if pid in self.programs
         ]
         has_duplicate_code = any(p.code == migrant.code for p in target_island_programs)
         if has_duplicate_code:
             logger.debug(
-                f"Skipping migration of program {migrant.id[:8]} to island {target_island} "
+                f"Skipping migration of program {migrant.id} to island {target_island} "
                 f"(duplicate code already exists)"
             )
             return
 
         migrant_copy = Program(
-            id=str(uuid.uuid4()),
+            id=self._copy_id(),
             code=migrant.code,
             changes_description=migrant.changes_description,
             language=migrant.language,
@@ -2128,7 +2152,7 @@ class ProgramDatabase:
             metadata={**migrant.metadata, "island": target_island, "migrant": True},
         )
         if self.add(migrant_copy, target_island=target_island) is not None:
-            logger.info("Program %s migrated to island %d", migrant_copy.id[:8], target_island)
+            logger.info("Program %s migrated to island %d", migrant_copy.id, target_island)
 
     def _validate_migration_results(self) -> None:
         """
@@ -2209,7 +2233,9 @@ class ProgramDatabase:
                 if best_id is None and len(self.islands[i]) > 0:
                     # Find new best program for this island
                     island_programs = [
-                        self.programs[pid] for pid in self.islands[i] if pid in self.programs
+                        self.programs[pid]
+                        for pid in self._ordered_ids(self.islands[i])
+                        if pid in self.programs
                     ]
                     if island_programs:
                         # Sort by fitness and update
@@ -2267,7 +2293,7 @@ class ProgramDatabase:
         sample_size = min(5, len(programs))  # Reduced from 10 to 5
 
         # Sort programs by ID for deterministic ordering
-        sorted_programs = sorted(programs, key=lambda p: p.id)
+        sorted_programs = sorted(programs, key=lambda p: (p.iteration_found, p.id))
 
         # Take first N programs instead of random sampling
         sample_programs = sorted_programs[:sample_size]

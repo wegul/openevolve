@@ -8,7 +8,6 @@ import os
 import shutil
 import signal
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -267,7 +266,7 @@ class OpenEvolve:
 
         if should_add_initial:
             logger.info("Adding initial program to database")
-            initial_program_id = str(uuid.uuid4())
+            initial_program_id = "initial"
 
             # Evaluate the initial program
             initial_metrics = await self.evaluator.evaluate_program(

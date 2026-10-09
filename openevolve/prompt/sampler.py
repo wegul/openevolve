@@ -18,6 +18,18 @@ from openevolve.utils.metrics_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _without_eval_time(values: Any) -> Any:
+    if isinstance(values, dict):
+        return {
+            key: _without_eval_time(value)
+            for key, value in values.items()
+            if key != "eval_time"
+        }
+    if isinstance(values, list):
+        return [_without_eval_time(value) for value in values]
+    return values
+
+
 class PromptSampler:
     """Generates prompts for code evolution"""
 
@@ -87,6 +99,12 @@ class PromptSampler:
         Returns:
             Dictionary with 'system' and 'user' keys
         """
+        program_metrics = _without_eval_time(program_metrics)
+        previous_programs = _without_eval_time(previous_programs)
+        top_programs = _without_eval_time(top_programs)
+        inspirations = _without_eval_time(inspirations)
+        program_artifacts = _without_eval_time(program_artifacts)
+
         # Select template based on evolution mode (with overrides)
         if template_key:
             # Use explicitly provided template key
@@ -670,7 +688,7 @@ class PromptSampler:
         sections = []
 
         # Process all artifacts using .items()
-        for key, value in artifacts.items():
+        for key, value in _without_eval_time(artifacts).items():
             content = self._safe_decode_artifact(value)
             # Truncate if too long
             if len(content) > self.config.max_artifact_bytes:

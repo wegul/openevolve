@@ -6,6 +6,7 @@ import asyncio
 import logging
 import multiprocessing as mp
 import pickle
+import random
 import signal
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -14,6 +15,7 @@ from dataclasses import asdict, dataclass
 from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
@@ -145,6 +147,13 @@ def _run_iteration_worker(
     try:
         # Lazy initialization
         _lazy_init_worker_components()
+
+        # A task's random choices must not depend on its worker's earlier tasks.
+        if _worker_config.random_seed is not None:
+            seed = _worker_config.random_seed + iteration
+            random.seed(seed)
+            np.random.seed(seed % (2**32))
+            _worker_llm_ensemble.random_state.seed(seed)
 
         # Reconstruct programs from snapshot
         programs = {pid: Program(**prog_dict) for pid, prog_dict in db_snapshot["programs"].items()}
@@ -358,9 +367,7 @@ def _run_iteration_worker(
             )
 
         # Evaluate the child program
-        import uuid
-
-        child_id = str(uuid.uuid4())
+        child_id = f"candidate-{iteration}"
         child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
 
         # Get artifacts
@@ -576,7 +583,7 @@ class ProcessParallelController:
         # Only include necessary data for workers
         snapshot = {
             "programs": {pid: prog.to_dict() for pid, prog in self.database.programs.items()},
-            "islands": [list(island) for island in self.database.islands],
+            "islands": [self.database._ordered_ids(island) for island in self.database.islands],
             "current_island": self.database.current_island,
             "feature_dimensions": self.database.config.feature_dimensions,
             "artifacts": {},  # Will be populated selectively
