@@ -17,7 +17,7 @@ from openevolve.evaluator import Evaluator
 from openevolve.evolution_trace import EvolutionTracer
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.population import PopulationStrategy
-from openevolve.process_parallel import ProcessParallelController
+from openevolve.process_parallel import ProcessParallelController, SerializableResult
 from openevolve.prompt.sampler import PromptSampler
 from openevolve.selection import IslandSelector
 from openevolve.utils.code_utils import extract_code_language
@@ -132,6 +132,7 @@ class OpenEvolve:
         self.database = ProgramDatabase(
             self.config.database, population_strategy=population_strategy
         )
+        self.generated_programs: Dict[str, SerializableResult] = {}
 
         self.evaluator = Evaluator(
             self.config.evaluator,
@@ -191,6 +192,7 @@ class OpenEvolve:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
         root_logger.addHandler(console_handler)
+        self._logging_handlers = (file_handler, console_handler)
 
         logger.info(f"Logging to {log_file}")
 
@@ -228,33 +230,8 @@ class OpenEvolve:
         with open(self.initial_program_path, "r") as f:
             return f.read()
 
-    async def run(
-        self,
-        iterations: Optional[int] = None,
-        target_score: Optional[float] = None,
-        checkpoint_path: Optional[str] = None,
-    ) -> Optional[Program]:
-        """
-        Run the evolution process with improved parallel processing
-
-        Args:
-            iterations: Maximum number of iterations (uses config if None)
-            target_score: Target score to reach (continues until reached if specified)
-            checkpoint_path: Path to resume from checkpoint
-
-        Returns:
-            Best program found
-        """
-        max_iterations = iterations or self.config.max_iterations
-        # Determine starting iteration
-        start_iteration = 0
-        if checkpoint_path and os.path.exists(checkpoint_path):
-            self._load_checkpoint(checkpoint_path)
-            start_iteration = self.database.last_iteration + 1
-            logger.info(f"Resuming from checkpoint at iteration {start_iteration}")
-        else:
-            start_iteration = self.database.last_iteration
-
+    async def _initialize_database(self, start_iteration: int = 0) -> bool:
+        """Evaluate and insert the initial program once."""
         # Only add initial program if starting fresh (not resuming from checkpoint)
         should_add_initial = (
             start_iteration == 0
@@ -282,6 +259,7 @@ class OpenEvolve:
                 iteration_found=start_iteration,
             )
 
+            self.initial_evaluation_finished_at = time.time()
             self.database.add(initial_program)
 
             # Check for and store artifacts from initial program
@@ -312,35 +290,132 @@ class OpenEvolve:
                 f"with {len(self.database.programs)} existing programs)"
             )
 
-        # Initialize improved parallel processing
+        return should_add_initial
+
+    def _start_parallel_controller(self) -> None:
+        """Start reusable execution resources for run() or step()."""
+        self.parallel_controller = ProcessParallelController(
+            self.config,
+            self.evaluation_file,
+            self.database,
+            self.evolution_tracer,
+            file_suffix=self.config.file_suffix,
+            island_selector=self.island_selector,
+        )
+
+        # Set up signal handlers for graceful shutdown
+        def signal_handler(signum, frame):
+            logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+            self.parallel_controller.request_shutdown()
+
+            # Set up a secondary handler for immediate exit if user presses Ctrl+C again
+            def force_exit_handler(signum, frame):
+                logger.info("Force exit requested - terminating immediately")
+                import sys
+
+                sys.exit(0)
+
+            signal.signal(signal.SIGINT, force_exit_handler)
+
+        self._previous_signal_handlers = {
+            sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)
+        }
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        self.parallel_controller.start()
+
+    def _close_parallel_controller(self) -> None:
+        """Close the pool, restore signals, and release this instance's trace and logs."""
         try:
-            self.parallel_controller = ProcessParallelController(
-                self.config,
-                self.evaluation_file,
-                self.database,
-                self.evolution_tracer,
-                file_suffix=self.config.file_suffix,
-                island_selector=self.island_selector,
-            )
+            if self.parallel_controller:
+                self.parallel_controller.stop()
+        finally:
+            self.parallel_controller = None
+            try:
+                for sig, handler in getattr(self, "_previous_signal_handlers", {}).items():
+                    signal.signal(sig, handler)
+                self._previous_signal_handlers = {}
+                if self.evolution_tracer:
+                    self.evolution_tracer.close()
+            finally:
+                for handler in getattr(self, "_logging_handlers", ()):
+                    logging.getLogger().removeHandler(handler)
+                    handler.close()
+                self._logging_handlers = ()
 
-            # Set up signal handlers for graceful shutdown
-            def signal_handler(signum, frame):
-                logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-                self.parallel_controller.request_shutdown()
+    async def __aenter__(self) -> "OpenEvolve":
+        if self.parallel_controller is not None:
+            raise RuntimeError("This evolution is already running")
+        try:
+            await self._initialize_database()
+            self._start_parallel_controller()
+            self.generated_programs = self.parallel_controller.generated_programs
+        except BaseException:
+            self._close_parallel_controller()
+            raise
+        return self
 
-                # Set up a secondary handler for immediate exit if user presses Ctrl+C again
-                def force_exit_handler(signum, frame):
-                    logger.info("Force exit requested - terminating immediately")
-                    import sys
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        try:
+            self._save_checkpoint(self.database.last_iteration)
+            self._save_best_program()
+            if exc_type is None and self.parallel_controller.shutdown_event.is_set():
+                raise asyncio.CancelledError("Evolution shutdown requested")
+        finally:
+            self._close_parallel_controller()
 
-                    sys.exit(0)
+    async def step(
+        self, *, parent_id: str, previous_programs: List[str], top_programs: List[str],
+        inspirations: List[str], target_island: int, generation_number: int,
+    ) -> SerializableResult:
+        """Generate and evaluate a child from explicit selections inside ``async with``.
 
-                signal.signal(signal.SIGINT, force_exit_handler)
+        All inputs are required. The three ordered ID lists may be empty.
+        IDs may reference earlier children even after population replacement removes them.
+        The result exposes ``child``, ``metrics``, ``error``, prompt and response.
+        Shutdown cancels the step so the context can save outputs and close workers.
+        """
+        if self.parallel_controller is None:
+            raise RuntimeError("Use step() inside 'async with evolution'")
+        return await self.parallel_controller.step(
+            parent_id=parent_id, previous_programs=previous_programs, top_programs=top_programs,
+            inspirations=inspirations, target_island=target_island, generation_number=generation_number,
+            checkpoint_callback=self._save_checkpoint,
+        )
 
-            signal.signal(signal.SIGINT, signal_handler)
-            signal.signal(signal.SIGTERM, signal_handler)
+    async def run(
+        self,
+        iterations: Optional[int] = None,
+        target_score: Optional[float] = None,
+        checkpoint_path: Optional[str] = None,
+    ) -> Optional[Program]:
+        """
+        Run the evolution process with improved parallel processing
 
-            self.parallel_controller.start()
+        Args:
+            iterations: Maximum number of iterations (uses config if None)
+            target_score: Target score to reach (continues until reached if specified)
+            checkpoint_path: Path to resume from checkpoint
+
+        Returns:
+            Best program found
+        """
+        max_iterations = iterations or self.config.max_iterations
+        try:
+            # Determine starting iteration
+            start_iteration = 0
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                self._load_checkpoint(checkpoint_path)
+                start_iteration = self.database.last_iteration + 1
+                logger.info(f"Resuming from checkpoint at iteration {start_iteration}")
+            else:
+                start_iteration = self.database.last_iteration
+
+            should_add_initial = await self._initialize_database(start_iteration)
+
+            # Initialize improved parallel processing
+            self._start_parallel_controller()
 
             # When starting from iteration 0, we've already done the initial program evaluation
             # So we need to adjust the start_iteration for the actual evolution
@@ -358,47 +433,38 @@ class OpenEvolve:
                 evolution_start, evolution_iterations, target_score
             )
 
-        finally:
-            # Clean up parallel processing resources
-            if self.parallel_controller:
-                self.parallel_controller.stop()
-                self.parallel_controller = None
+            # Get the best program
+            best_program = None
+            if self.database.best_program_id:
+                best_program = self.database.get(self.database.best_program_id)
+                logger.info(f"Using tracked best program: {self.database.best_program_id}")
 
-            # Close evolution tracer
-            if self.evolution_tracer:
-                self.evolution_tracer.close()
-                logger.info("Evolution tracer closed")
+            if best_program is None:
+                best_program = self.database.get_best_program()
+                logger.info("Using calculated best program (tracked program not found)")
 
-        # Get the best program
-        best_program = None
-        if self.database.best_program_id:
-            best_program = self.database.get(self.database.best_program_id)
-            logger.info(f"Using tracked best program: {self.database.best_program_id}")
-
-        if best_program is None:
-            best_program = self.database.get_best_program()
-            logger.info("Using calculated best program (tracked program not found)")
-
-        if best_program:
-            if (
-                hasattr(self, "parallel_controller")
-                and self.parallel_controller
-                and self.parallel_controller.early_stopping_triggered
-            ):
-                logger.info(
-                    f"🛑 Evolution complete via early stopping. Best program has metrics: "
-                    f"{format_metrics_safe(best_program.metrics)}"
-                )
+            if best_program:
+                if (
+                    hasattr(self, "parallel_controller")
+                    and self.parallel_controller
+                    and self.parallel_controller.early_stopping_triggered
+                ):
+                    logger.info(
+                        f"🛑 Evolution complete via early stopping. Best program has metrics: "
+                        f"{format_metrics_safe(best_program.metrics)}"
+                    )
+                else:
+                    logger.info(
+                        f"Evolution complete. Best program has metrics: "
+                        f"{format_metrics_safe(best_program.metrics)}"
+                    )
+                self._save_best_program(best_program)
+                return best_program
             else:
-                logger.info(
-                    f"Evolution complete. Best program has metrics: "
-                    f"{format_metrics_safe(best_program.metrics)}"
-                )
-            self._save_best_program(best_program)
-            return best_program
-        else:
-            logger.warning("No valid programs found during evolution")
-            return None
+                logger.warning("No valid programs found during evolution")
+                return None
+        finally:
+            self._close_parallel_controller()
 
     def _log_iteration(
         self,

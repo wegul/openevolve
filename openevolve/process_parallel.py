@@ -11,7 +11,7 @@ import signal
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,6 +43,15 @@ class SerializableResult:
     error: Optional[str] = None
     target_island: Optional[int] = None  # Island where child should be placed
     token_usage: Optional[Dict[str, Any]] = None
+    admitted: bool = False
+
+    @property
+    def child(self) -> Optional[Program]:
+        return Program(**self.child_program_dict) if self.child_program_dict else None
+
+    @property
+    def metrics(self) -> Dict[str, Any]:
+        return self.child_program_dict.get("metrics", {}) if self.child_program_dict else {}
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -140,10 +149,41 @@ def _lazy_init_worker_components():
         )
 
 
+def default_prompt_context(snapshot: Dict[str, Any], parent_id: str, prompt_config) -> Dict[str, List[str]]:
+    """Apply the ordinary island ranking rules before executing a generation."""
+    programs = snapshot["programs"]
+    parent = programs[parent_id]
+    island = parent.get("metadata", {}).get("island", snapshot["current_island"])
+    ranked = [pid for pid in snapshot["islands"][island] if pid in programs]
+    ranked.sort(
+        key=lambda pid: programs[pid]["metrics"].get(
+            "combined_score", safe_numeric_average(programs[pid]["metrics"])
+        ),
+        reverse=True,
+    )
+    return {
+        "previous_programs": ranked[:prompt_config.num_top_programs],
+        "top_programs": ranked[:prompt_config.num_top_programs + prompt_config.num_diverse_programs],
+    }
+
+
 def _run_iteration_worker(
     iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
 ) -> SerializableResult:
     """Run a single iteration in a worker process"""
+    prompt = None
+    llm_response = None
+    token_usage = None
+    worker_started = time.time()
+
+    def make_result(**fields):
+        defaults = dict(iteration=iteration, parent_id=parent_id, prompt=prompt,
+                        llm_response=llm_response, token_usage=token_usage,
+                        target_island=db_snapshot.get("sampling_island"),
+                        iteration_time=time.time() - worker_started)
+        defaults.update(fields)
+        return SerializableResult(**defaults)
+
     try:
         # Lazy initialization
         _lazy_init_worker_components()
@@ -164,25 +204,12 @@ def _run_iteration_worker(
         # Get parent artifacts if available
         parent_artifacts = db_snapshot["artifacts"].get(parent_id)
 
-        # Get island-specific programs for context
         parent_island = parent.metadata.get("island", db_snapshot["current_island"])
-        island_programs = [
-            programs[pid] for pid in db_snapshot["islands"][parent_island] if pid in programs
-        ]
-
-        # Sort by metrics for top programs
-        island_programs.sort(
-            key=lambda p: p.metrics.get("combined_score", safe_numeric_average(p.metrics)),
-            reverse=True,
-        )
-
-        # Use config values for limits instead of hardcoding
-        # Programs for LLM display (includes both top and diverse for inspiration)
-        programs_for_prompt = island_programs[
-            : _worker_config.prompt.num_top_programs + _worker_config.prompt.num_diverse_programs
-        ]
-        # Best programs only (for previous attempts section, focused on top performers)
-        best_programs_only = island_programs[: _worker_config.prompt.num_top_programs]
+        selection = db_snapshot.get("prompt_selection")
+        if selection is None:
+            selection = default_prompt_context(db_snapshot, parent_id, _worker_config.prompt)
+        best_programs_only = [programs[pid] for pid in selection["previous_programs"]]
+        programs_for_prompt = [programs[pid] for pid in selection["top_programs"]]
 
         # Build prompt
         if _worker_config.prompt.programs_as_changes_description:
@@ -223,13 +250,11 @@ def _run_iteration_worker(
             token_usage = getattr(_worker_llm_ensemble, "last_usage", None)
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
-            return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
+            return make_result(error=f"LLM generation failed: {str(e)}")
 
         # Check for None response
         if llm_response is None:
-            return SerializableResult(
-                error="LLM returned None response", iteration=iteration, token_usage=token_usage
-            )
+            return make_result(error="LLM returned None response")
 
         # Parse response based on evolution mode
         if _worker_config.diff_based_evolution:
@@ -243,15 +268,9 @@ def _run_iteration_worker(
             try:
                 diff_blocks = extract_diffs(llm_response, _worker_config.diff_pattern)
             except ValueError as exc:
-                return SerializableResult(
-                    error=str(exc), iteration=iteration, token_usage=token_usage
-                )
+                return make_result(error=str(exc))
             if not diff_blocks:
-                return SerializableResult(
-                    error="No valid diffs found in response",
-                    iteration=iteration,
-                    token_usage=token_usage,
-                )
+                return make_result(error="No valid diffs found in response")
 
             if _worker_config.prompt.programs_as_changes_description:
                 try:
@@ -261,9 +280,7 @@ def _run_iteration_worker(
                         changes_description_text=parent_changes_desc,
                     )
                 except Exception as e:
-                    return SerializableResult(
-                        error=str(e), iteration=iteration, token_usage=token_usage
-                    )
+                    return make_result(error=str(e))
 
                 child_code, _ = apply_diff_blocks(parent.code, code_blocks)
                 child_changes_desc, desc_applied = apply_diff_blocks(
@@ -276,10 +293,8 @@ def _run_iteration_worker(
                     or not child_changes_desc.strip()
                     or child_changes_desc.strip() == parent_changes_desc.strip()
                 ):
-                    return SerializableResult(
-                        error="changes_description was not updated or empty, program is discarded",
-                        iteration=iteration,
-                        token_usage=token_usage,
+                    return make_result(
+                        error="changes_description was not updated or empty, program is discarded"
                     )
 
                 changes_summary = format_diff_summary(
@@ -291,13 +306,11 @@ def _run_iteration_worker(
                 # All diffs applied only to code
                 child_code, applied = apply_diff_blocks(parent.code, diff_blocks)
                 if applied == 0:
-                    return SerializableResult(
+                    return make_result(
                         error=(
                             f"None of the {len(diff_blocks)} SEARCH block(s) matched the "
                             "parent program"
                         ),
-                        iteration=iteration,
-                        token_usage=token_usage,
                     )
                 if applied < len(diff_blocks):
                     logger.warning(
@@ -305,11 +318,7 @@ def _run_iteration_worker(
                         "SEARCH block(s) matched the parent program"
                     )
                 if child_code == parent.code:
-                    return SerializableResult(
-                        error="Diff did not change the parent program",
-                        iteration=iteration,
-                        token_usage=token_usage,
-                    )
+                    return make_result(error="Diff did not change the parent program")
                 changes_summary = format_diff_summary(
                     diff_blocks,
                     max_line_len=_worker_config.prompt.diff_summary_max_line_len,
@@ -320,18 +329,10 @@ def _run_iteration_worker(
 
             new_code = parse_full_rewrite(llm_response, _worker_config.language)
             if not new_code:
-                return SerializableResult(
-                    error=f"No valid code found in response",
-                    iteration=iteration,
-                    token_usage=token_usage,
-                )
+                return make_result(error=f"No valid code found in response")
 
             if new_code == parent.code:
-                return SerializableResult(
-                    error="Rewrite is identical to the parent program",
-                    iteration=iteration,
-                    token_usage=token_usage,
-                )
+                return make_result(error="Rewrite is identical to the parent program")
 
             child_code = new_code
             changes_summary = "Full rewrite"
@@ -343,27 +344,19 @@ def _run_iteration_worker(
             try:
                 enforced_code = enforce_evolve_blocks(parent.code, child_code)
             except ValueError as exc:
-                return SerializableResult(
-                    error=str(exc), iteration=iteration, token_usage=token_usage
-                )
+                return make_result(error=str(exc))
             if enforced_code != child_code:
                 logger.info(
                     f"Iteration {iteration}: reverted edits outside the EVOLVE-BLOCK regions"
                 )
                 child_code = enforced_code
                 if child_code == parent.code:
-                    return SerializableResult(
-                        error="All edits were outside the EVOLVE-BLOCK regions",
-                        iteration=iteration,
-                        token_usage=token_usage,
-                    )
+                    return make_result(error="All edits were outside the EVOLVE-BLOCK regions")
 
         # Check code length
         if len(child_code) > _worker_config.max_code_length:
-            return SerializableResult(
+            return make_result(
                 error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
-                iteration=iteration,
-                token_usage=token_usage,
             )
 
         # Evaluate the child program
@@ -393,24 +386,15 @@ def _run_iteration_worker(
 
         iteration_time = time.time() - iteration_start
 
-        # Get target island from snapshot (where child should be placed)
-        target_island = db_snapshot.get("sampling_island")
-
-        return SerializableResult(
+        return make_result(
             child_program_dict=child_program.to_dict(),
-            parent_id=parent.id,
             iteration_time=iteration_time,
-            prompt=prompt,
-            llm_response=llm_response,
             artifacts=artifacts,
-            iteration=iteration,
-            target_island=target_island,
-            token_usage=token_usage,
         )
 
     except Exception as e:
         logger.exception(f"Error in worker iteration {iteration}")
-        return SerializableResult(error=str(e), iteration=iteration)
+        return make_result(error=str(e))
 
 
 def _wait_for_processes(processes: tuple[mp.Process, ...], timeout: float) -> list[mp.Process]:
@@ -486,6 +470,12 @@ class ProcessParallelController:
         self.evolution_tracer = evolution_tracer
         self.file_suffix = file_suffix
         self.island_selector = island_selector
+        # Explicit selections can refer to a program after it leaves the population.
+        self.generated_programs: Dict[str, SerializableResult] = {
+            pid: SerializableResult(child_program_dict=program.to_dict(),
+                                    artifacts=database.get_artifacts(pid))
+            for pid, program in database.programs.items()
+        }
 
         self.executor: Optional[ProcessPoolExecutor] = None
         self.shutdown_event = mp.Event()
@@ -644,6 +634,198 @@ class ProcessParallelController:
             if callback:
                 callback(iteration)
 
+    def process_result(self, result: SerializableResult, iteration: int, checkpoint_callback=None) -> Program:
+        """Commit a worker result using the same rules for ordinary runs and step()."""
+        token_str = ""
+        if result.token_usage:
+            pt = result.token_usage.get("prompt_tokens", 0)
+            ct = result.token_usage.get("completion_tokens", 0)
+            tt = result.token_usage.get("total_tokens", 0)
+            token_str = f" | tokens: {tt} (prompt: {pt}, completion: {ct})"
+        # Reconstruct program from dict
+        child_program = Program(**result.child_program_dict)
+
+        # Add to database with explicit target_island to ensure proper island placement
+        # This fixes issue #391: children should go to the target island, not inherit
+        # from the parent (which may be from a different island due to fallback sampling)
+        admitted_id = self.database.add(
+            child_program,
+            iteration=iteration,
+            target_island=result.target_island,
+        )
+        if admitted_id is None:
+            raise _CandidateRejected(child_program.id)
+
+        result.admitted = True
+        result.child_program_dict = child_program.to_dict()
+
+        # Store artifacts
+        if result.artifacts:
+            self.database.store_artifacts(child_program.id, result.artifacts)
+
+        # Log evolution trace
+        if self.evolution_tracer:
+            # Retrieve parent program for trace logging
+            parent_program = (
+                self.database.get(result.parent_id) if result.parent_id else None
+            )
+            if parent_program:
+                # Determine island ID
+                island_id = child_program.metadata.get(
+                    "island", self.database.current_island
+                )
+
+                self.evolution_tracer.log_trace(
+                    iteration=iteration,
+                    parent_program=parent_program,
+                    child_program=child_program,
+                    prompt=result.prompt,
+                    llm_response=result.llm_response,
+                    artifacts=result.artifacts,
+                    island_id=island_id,
+                    metadata={
+                        "iteration_time": result.iteration_time,
+                        "changes": child_program.metadata.get("changes", ""),
+                        "token_usage": result.token_usage,
+                    },
+                )
+
+        # Log prompts
+        if result.prompt:
+            self.database.log_prompt(
+                template_key=(
+                    "full_rewrite_user"
+                    if not self.config.diff_based_evolution
+                    else "diff_user"
+                ),
+                program_id=child_program.id,
+                prompt=result.prompt,
+                responses=[result.llm_response] if result.llm_response else [],
+                token_usage=result.token_usage,
+            )
+
+        # Island management
+        # get current program island id
+        island_id = child_program.metadata.get("island", self.database.current_island)
+        # use this to increment island generation
+        self.database.increment_island_generation(island_idx=island_id)
+
+        # Check migration
+        if self.database.should_migrate():
+            logger.info(f"Performing migration at iteration {iteration}")
+            self.database.migrate_programs()
+            self.database.log_island_status()
+
+        # Log progress
+        logger.info(
+            f"Iteration {iteration}: "
+            f"Program {child_program.id} "
+            f"(parent: {result.parent_id}) "
+            f"completed in {result.iteration_time:.2f}s{token_str}"
+        )
+
+        if child_program.metrics:
+            metrics_str = ", ".join(
+                [
+                    f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
+                    for k, v in child_program.metrics.items()
+                ]
+            )
+            logger.info(f"Metrics: {metrics_str}")
+
+            # Check if this is the first program without combined_score
+            if not hasattr(self, "_warned_about_combined_score"):
+                self._warned_about_combined_score = False
+
+            if (
+                "combined_score" not in child_program.metrics
+                and not self._warned_about_combined_score
+            ):
+                avg_score = safe_numeric_average(child_program.metrics)
+                logger.warning(
+                    f"⚠️  No 'combined_score' metric found in evaluation results. "
+                    f"Using average of all numeric metrics ({avg_score:.4f}) for evolution guidance. "
+                    f"For better evolution results, please modify your evaluator to return a 'combined_score' "
+                    f"metric that properly weights different aspects of program performance."
+                )
+                self._warned_about_combined_score = True
+
+        # Check for new best
+        if self.database.best_program_id == child_program.id:
+            logger.info(
+                f"🌟 New best solution found at iteration {iteration}: "
+                f"{child_program.id}"
+            )
+
+        result.child_program_dict = child_program.to_dict()
+        self._checkpoint_if_due(iteration, checkpoint_callback)
+        return child_program
+
+    async def step(
+        self, *, parent_id: str, previous_programs: List[str], top_programs: List[str],
+        inspirations: List[str], target_island: int, generation_number: int,
+        checkpoint_callback=None,
+    ) -> SerializableResult:
+        """Execute supplied selections and finish database processing before returning."""
+        if self.shutdown_event.is_set():
+            raise asyncio.CancelledError("Evolution shutdown requested")
+        if self.executor is None:
+            raise RuntimeError("The evolution worker pool is not running")
+        if type(target_island) is not int or not 0 <= target_island < self.num_islands:
+            raise ValueError("Invalid destination island")
+        if type(generation_number) is not int or generation_number <= self.database.last_iteration:
+            raise ValueError("Generation numbers must be positive and increase within a run")
+        for name, ids in (("previous_programs", previous_programs), ("top_programs", top_programs),
+                          ("inspirations", inspirations)):
+            if not isinstance(ids, (list, tuple)) or any(not isinstance(pid, str) for pid in ids):
+                raise ValueError(f"{name} must be an ordered list of program IDs")
+        selected = [parent_id, *previous_programs, *top_programs, *inspirations]
+        missing = [pid for pid in selected
+                   if pid not in self.database.programs and pid not in self.generated_programs]
+        if missing:
+            raise ValueError(f"Selected programs are unavailable: {missing}")
+        snapshot = self._create_database_snapshot()
+        for pid in selected:
+            if pid not in snapshot["programs"]:
+                snapshot["programs"][pid] = self.generated_programs[pid].child_program_dict
+        snapshot["sampling_island"] = target_island
+        snapshot["prompt_selection"] = {
+            "previous_programs": list(previous_programs), "top_programs": list(top_programs),
+        }
+        # Always include the selected parent's artifacts, regardless of the snapshot cap.
+        artifacts = (self.database.get_artifacts(parent_id) if parent_id in self.database.programs
+                     else self.generated_programs[parent_id].artifacts)
+        if artifacts:
+            snapshot["artifacts"][parent_id] = artifacts
+        result = SerializableResult(iteration=generation_number, parent_id=parent_id,
+                                    target_island=target_island)
+        try:
+            future = self.executor.submit(
+                _run_iteration_worker, generation_number, snapshot, parent_id, list(inspirations)
+            )
+            pending = asyncio.wrap_future(future)
+            try:
+                while not pending.done() and not self.shutdown_event.is_set():
+                    await asyncio.wait([pending], timeout=0.1)
+                if self.shutdown_event.is_set():
+                    raise asyncio.CancelledError("Evolution shutdown requested")
+                result = await pending
+            finally:
+                pending.cancel()
+            if not result.error and result.child_program_dict:
+                self.process_result(result, generation_number, checkpoint_callback)
+        except Exception as exc:
+            if getattr(exc, "_openevolve_strategy_error", False):
+                raise
+            result.error = f"{type(exc).__name__}: {exc}"
+        self.database.last_iteration = max(self.database.last_iteration, generation_number)
+        if result.child_program_dict:
+            pid = result.child_program_dict["id"]
+            self.generated_programs[pid] = replace(
+                result, artifacts=self.database.get_artifacts(pid) or result.artifacts
+            )
+        return result
+
     async def run_evolution(
         self,
         start_iteration: int,
@@ -759,119 +941,7 @@ class ProcessParallelController:
                         f"Iteration {completed_iteration} error: {result.error}{token_str}"
                     )
                 elif result.child_program_dict:
-                    # Reconstruct program from dict
-                    child_program = Program(**result.child_program_dict)
-
-                    # Add to database with explicit target_island to ensure proper island placement
-                    # This fixes issue #391: children should go to the target island, not inherit
-                    # from the parent (which may be from a different island due to fallback sampling)
-                    admitted_id = self.database.add(
-                        child_program,
-                        iteration=completed_iteration,
-                        target_island=result.target_island,
-                    )
-                    if admitted_id is None:
-                        raise _CandidateRejected(child_program.id)
-
-                    # Store artifacts
-                    if result.artifacts:
-                        self.database.store_artifacts(child_program.id, result.artifacts)
-
-                    # Log evolution trace
-                    if self.evolution_tracer:
-                        # Retrieve parent program for trace logging
-                        parent_program = (
-                            self.database.get(result.parent_id) if result.parent_id else None
-                        )
-                        if parent_program:
-                            # Determine island ID
-                            island_id = child_program.metadata.get(
-                                "island", self.database.current_island
-                            )
-
-                            self.evolution_tracer.log_trace(
-                                iteration=completed_iteration,
-                                parent_program=parent_program,
-                                child_program=child_program,
-                                prompt=result.prompt,
-                                llm_response=result.llm_response,
-                                artifacts=result.artifacts,
-                                island_id=island_id,
-                                metadata={
-                                    "iteration_time": result.iteration_time,
-                                    "changes": child_program.metadata.get("changes", ""),
-                                    "token_usage": result.token_usage,
-                                },
-                            )
-
-                    # Log prompts
-                    if result.prompt:
-                        self.database.log_prompt(
-                            template_key=(
-                                "full_rewrite_user"
-                                if not self.config.diff_based_evolution
-                                else "diff_user"
-                            ),
-                            program_id=child_program.id,
-                            prompt=result.prompt,
-                            responses=[result.llm_response] if result.llm_response else [],
-                            token_usage=result.token_usage,
-                        )
-
-                    # Island management
-                    # get current program island id
-                    island_id = child_program.metadata.get("island", self.database.current_island)
-                    # use this to increment island generation
-                    self.database.increment_island_generation(island_idx=island_id)
-
-                    # Check migration
-                    if self.database.should_migrate():
-                        logger.info(f"Performing migration at iteration {completed_iteration}")
-                        self.database.migrate_programs()
-                        self.database.log_island_status()
-
-                    # Log progress
-                    logger.info(
-                        f"Iteration {completed_iteration}: "
-                        f"Program {child_program.id} "
-                        f"(parent: {result.parent_id}) "
-                        f"completed in {result.iteration_time:.2f}s{token_str}"
-                    )
-
-                    if child_program.metrics:
-                        metrics_str = ", ".join(
-                            [
-                                f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
-                                for k, v in child_program.metrics.items()
-                            ]
-                        )
-                        logger.info(f"Metrics: {metrics_str}")
-
-                        # Check if this is the first program without combined_score
-                        if not hasattr(self, "_warned_about_combined_score"):
-                            self._warned_about_combined_score = False
-
-                        if (
-                            "combined_score" not in child_program.metrics
-                            and not self._warned_about_combined_score
-                        ):
-                            avg_score = safe_numeric_average(child_program.metrics)
-                            logger.warning(
-                                f"⚠️  No 'combined_score' metric found in evaluation results. "
-                                f"Using average of all numeric metrics ({avg_score:.4f}) for evolution guidance. "
-                                f"For better evolution results, please modify your evaluator to return a 'combined_score' "
-                                f"metric that properly weights different aspects of program performance."
-                            )
-                            self._warned_about_combined_score = True
-
-                    # Check for new best
-                    if self.database.best_program_id == child_program.id:
-                        logger.info(
-                            f"🌟 New best solution found at iteration {completed_iteration}: "
-                            f"{child_program.id}"
-                        )
-
-                    self._checkpoint_if_due(completed_iteration, checkpoint_callback)
+                    child_program = self.process_result(result, completed_iteration, checkpoint_callback)
 
                     # Check target score
                     if target_score is not None and child_program.metrics:
@@ -1041,6 +1111,7 @@ class ProcessParallelController:
             # Create database snapshot
             db_snapshot = self._create_database_snapshot()
             db_snapshot["sampling_island"] = target_island  # Mark which island this is for
+            db_snapshot["prompt_selection"] = default_prompt_context(db_snapshot, parent.id, self.config.prompt)
 
             # Submit to process pool
             future = self.executor.submit(

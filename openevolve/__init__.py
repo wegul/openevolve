@@ -5,6 +5,7 @@ OpenEvolve: An open-source implementation of AlphaEvolve
 from openevolve._version import __version__
 from openevolve.config import Config
 from openevolve.controller import OpenEvolve
+from openevolve.process_parallel import SerializableResult as StepResult
 from openevolve.api import (
     run_evolution,
     evolve_function,
@@ -16,6 +17,7 @@ from openevolve.api import (
 __all__ = [
     "Config",
     "OpenEvolve",
+    "StepResult",
     "__version__",
     "run_evolution",
     "evolve_function",
