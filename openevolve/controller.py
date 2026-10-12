@@ -18,6 +18,7 @@ from openevolve.evolution_trace import EvolutionTracer
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.population import PopulationStrategy
 from openevolve.process_parallel import ProcessParallelController, SerializableResult
+from openevolve.dispatch import RequestDispatcher
 from openevolve.prompt.sampler import PromptSampler
 from openevolve.selection import IslandSelector
 from openevolve.utils.code_utils import extract_code_language
@@ -48,10 +49,12 @@ class OpenEvolve:
         output_dir: Optional[str] = None,
         island_selector: Optional[IslandSelector] = None,
         population_strategy: Optional[PopulationStrategy] = None,
+        request_dispatcher: Optional[RequestDispatcher] = None,
     ):
         # Load configuration (loaded in main_async)
         self.config = config
         self.island_selector = island_selector
+        self.request_dispatcher = request_dispatcher
 
         # Set up output directory
         self.output_dir = output_dir or os.path.join(
@@ -301,6 +304,7 @@ class OpenEvolve:
             self.evolution_tracer,
             file_suffix=self.config.file_suffix,
             island_selector=self.island_selector,
+            request_dispatcher=self.request_dispatcher,
         )
 
         # Set up signal handlers for graceful shutdown
