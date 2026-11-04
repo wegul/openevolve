@@ -11,7 +11,7 @@ import signal
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,7 +19,6 @@ import numpy as np
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
-from openevolve.dispatch import RequestDispatcher, _RequestQueue
 from openevolve.selection import IslandSelectionContext, IslandSelector, IslandState
 from openevolve.utils.metrics_utils import safe_numeric_average
 
@@ -498,7 +497,6 @@ class ProcessParallelController:
         evolution_tracer=None,
         file_suffix: str = ".py",
         island_selector: Optional[IslandSelector] = None,
-        request_dispatcher: Optional[RequestDispatcher] = None,
     ):
         self.config = config
         self.evaluation_file = evaluation_file
@@ -506,16 +504,7 @@ class ProcessParallelController:
         self.evolution_tracer = evolution_tracer
         self.file_suffix = file_suffix
         self.island_selector = island_selector
-        self.request_dispatcher = request_dispatcher
         self.request_observer = None
-        self._request_queue = None
-        # Explicit selections can refer to a program after it leaves the population.
-        self.generated_programs: Dict[str, SerializableResult] = {
-            pid: SerializableResult(child_program_dict=program.to_dict(),
-                                    artifacts=database.get_artifacts(pid))
-            for pid, program in database.programs.items()
-        }
-
         self.executor: Optional[ProcessPoolExecutor] = None
         self.shutdown_event = mp.Event()
         self.early_stopping_triggered = False
@@ -594,8 +583,6 @@ class ProcessParallelController:
     def stop(self) -> None:
         """Stop the process pool"""
         self.shutdown_event.set()
-        if self._request_queue is not None:
-            self._request_queue.close()
 
         executor = self.executor
         self.executor = None
@@ -676,7 +663,7 @@ class ProcessParallelController:
                 callback(iteration)
 
     def process_result(self, result: SerializableResult, iteration: int, checkpoint_callback=None) -> Program:
-        """Commit a worker result using the same rules for ordinary runs and step()."""
+        """Commit a worker result using native database admission and checkpoint rules."""
         token_str = ""
         if result.token_usage:
             pt = result.token_usage.get("prompt_tokens", 0)
@@ -803,52 +790,6 @@ class ProcessParallelController:
         self._checkpoint_if_due(iteration, checkpoint_callback)
         return child_program
 
-    async def step(
-        self, *, parent_id: str, previous_programs: List[str], top_programs: List[str],
-        inspirations: List[str], target_island: int, generation_number: int,
-        checkpoint_callback=None,
-    ) -> SerializableResult:
-        """Execute supplied selections and finish database processing before returning."""
-        if self.shutdown_event.is_set():
-            raise asyncio.CancelledError("Evolution shutdown requested")
-        if self.executor is None:
-            raise RuntimeError("The evolution worker pool is not running")
-        if type(target_island) is not int or not 0 <= target_island < self.num_islands:
-            raise ValueError("Invalid destination island")
-        if type(generation_number) is not int or generation_number <= self.database.last_iteration:
-            raise ValueError("Generation numbers must be positive and increase within a run")
-        for name, ids in (("previous_programs", previous_programs), ("top_programs", top_programs),
-                          ("inspirations", inspirations)):
-            if not isinstance(ids, (list, tuple)) or any(not isinstance(pid, str) for pid in ids):
-                raise ValueError(f"{name} must be an ordered list of program IDs")
-        selected = [parent_id, *previous_programs, *top_programs, *inspirations]
-        missing = [pid for pid in selected
-                   if pid not in self.database.programs and pid not in self.generated_programs]
-        if missing:
-            raise ValueError(f"Selected programs are unavailable: {missing}")
-        snapshot = self._create_database_snapshot()
-        for pid in selected:
-            if pid not in snapshot["programs"]:
-                snapshot["programs"][pid] = self.generated_programs[pid].child_program_dict
-        snapshot["sampling_island"] = target_island
-        snapshot["prompt_selection"] = {
-            "previous_programs": list(previous_programs), "top_programs": list(top_programs),
-        }
-        # Always include the selected parent's artifacts, regardless of the snapshot cap.
-        artifacts = (self.database.get_artifacts(parent_id) if parent_id in self.database.programs
-                     else self.generated_programs[parent_id].artifacts)
-        if artifacts:
-            snapshot["artifacts"][parent_id] = artifacts
-        request = PreparedRequest(generation_number, target_island, parent_id,
-                                  pickle.dumps((snapshot, list(inspirations))))
-        result = await self._execute_request(request, checkpoint_callback)
-        if result.child_program_dict:
-            pid = result.child_program_dict["id"]
-            self.generated_programs[pid] = replace(
-                result, artifacts=self.database.get_artifacts(pid) or result.artifacts
-            )
-        return result
-
     def _prepare_request(self, generation_number: int, target_island: int) -> PreparedRequest:
         parent, inspirations = self.database.sample_from_island(
             island_id=target_island,
@@ -861,7 +802,7 @@ class ProcessParallelController:
                                pickle.dumps((snapshot, [p.id for p in inspirations])))
 
     async def _execute_request(self, request: PreparedRequest, checkpoint_callback=None) -> SerializableResult:
-        """Execute a prepared request in any order and apply normal database processing."""
+        """Execute a prepared request and apply normal database processing."""
         if self.shutdown_event.is_set():
             raise asyncio.CancelledError("Evolution shutdown requested")
         if self.executor is None:
@@ -902,11 +843,6 @@ class ProcessParallelController:
         """Run evolution with process-based parallelism"""
         if not self.executor:
             raise RuntimeError("Process pool not started")
-        if self.request_dispatcher is not None:
-            self._request_queue = _RequestQueue(
-                self.executor, self.num_workers, self.request_dispatcher,
-                _run_iteration_worker, self.shutdown_event, self._request_event)
-
         total_iterations = start_iteration + max_iterations
 
         logger.info(
@@ -976,23 +912,12 @@ class ProcessParallelController:
             and completed_iterations < max_iterations
             and not self.shutdown_event.is_set()
         ):
-            if self._request_queue is not None:
-                self._request_queue.check()
-            # The native path retains its existing scan. Reordered requests
-            # must be admitted in completion order even when several finish
-            # before this polling cycle.
             completed_iteration = None
-            if self._request_queue is not None:
-                completed_iteration = self._request_queue.pop_completed()
-            else:
-                for iteration, future in list(pending_futures.items()):
-                    if future.done():
-                        completed_iteration = iteration
-                        break
-
+            for iteration, future in list(pending_futures.items()):
+                if future.done():
+                    completed_iteration = iteration
+                    break
             if completed_iteration is None:
-                if self._request_queue is not None:
-                    self._request_queue.ensure_progress()
                 await asyncio.sleep(0.01)
                 continue
 
@@ -1178,8 +1103,6 @@ class ProcessParallelController:
                 f"(prompt_tokens={total_prompt_tokens}, completion_tokens={total_completion_tokens})"
             )
 
-        if self._request_queue is not None:
-            self._request_queue.close()
         return self.database.get_best_program()
 
     def _request_event(self, event, **fields):
@@ -1195,13 +1118,9 @@ class ProcessParallelController:
             request = self._prepare_request(iteration, target_island)
             self._request_event('prepared', creation_id=iteration, target_island=target_island,
                                 parent_id=request.parent_id)
-            if self._request_queue is not None:
-                return self._request_queue.add(request)
             self._request_event('submitted', creation_id=iteration)
             return self.executor.submit(_run_iteration_worker, *request.worker_inputs())
 
         except Exception as e:
-            if getattr(e, "_openevolve_dispatch_error", False):
-                raise
             logger.error(f"Error submitting iteration {iteration}: {e}")
             return None

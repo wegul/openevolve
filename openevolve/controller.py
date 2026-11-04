@@ -17,8 +17,7 @@ from openevolve.evaluator import Evaluator
 from openevolve.evolution_trace import EvolutionTracer
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.population import PopulationStrategy
-from openevolve.process_parallel import ProcessParallelController, SerializableResult
-from openevolve.dispatch import RequestDispatcher
+from openevolve.process_parallel import ProcessParallelController
 from openevolve.prompt.sampler import PromptSampler
 from openevolve.selection import IslandSelector
 from openevolve.utils.code_utils import extract_code_language
@@ -49,12 +48,10 @@ class OpenEvolve:
         output_dir: Optional[str] = None,
         island_selector: Optional[IslandSelector] = None,
         population_strategy: Optional[PopulationStrategy] = None,
-        request_dispatcher: Optional[RequestDispatcher] = None,
     ):
         # Load configuration (loaded in main_async)
         self.config = config
         self.island_selector = island_selector
-        self.request_dispatcher = request_dispatcher
 
         # Set up output directory
         self.output_dir = output_dir or os.path.join(
@@ -135,7 +132,6 @@ class OpenEvolve:
         self.database = ProgramDatabase(
             self.config.database, population_strategy=population_strategy
         )
-        self.generated_programs: Dict[str, SerializableResult] = {}
 
         self.evaluator = Evaluator(
             self.config.evaluator,
@@ -296,7 +292,7 @@ class OpenEvolve:
         return should_add_initial
 
     def _start_parallel_controller(self) -> None:
-        """Start reusable execution resources for run() or step()."""
+        """Start reusable execution resources for ordinary execution."""
         self.parallel_controller = ProcessParallelController(
             self.config,
             self.evaluation_file,
@@ -304,7 +300,6 @@ class OpenEvolve:
             self.evolution_tracer,
             file_suffix=self.config.file_suffix,
             island_selector=self.island_selector,
-            request_dispatcher=self.request_dispatcher,
         )
 
         # Set up signal handlers for graceful shutdown
@@ -354,7 +349,6 @@ class OpenEvolve:
         try:
             await self._initialize_database()
             self._start_parallel_controller()
-            self.generated_programs = self.parallel_controller.generated_programs
         except BaseException:
             self._close_parallel_controller()
             raise
@@ -368,25 +362,6 @@ class OpenEvolve:
                 raise asyncio.CancelledError("Evolution shutdown requested")
         finally:
             self._close_parallel_controller()
-
-    async def step(
-        self, *, parent_id: str, previous_programs: List[str], top_programs: List[str],
-        inspirations: List[str], target_island: int, generation_number: int,
-    ) -> SerializableResult:
-        """Generate and evaluate a child from explicit selections inside ``async with``.
-
-        All inputs are required. The three ordered ID lists may be empty.
-        IDs may reference earlier children even after population replacement removes them.
-        The result exposes ``child``, ``metrics``, ``error``, prompt and response.
-        Shutdown cancels the step so the context can save outputs and close workers.
-        """
-        if self.parallel_controller is None:
-            raise RuntimeError("Use step() inside 'async with evolution'")
-        return await self.parallel_controller.step(
-            parent_id=parent_id, previous_programs=previous_programs, top_programs=top_programs,
-            inspirations=inspirations, target_island=target_island, generation_number=generation_number,
-            checkpoint_callback=self._save_checkpoint,
-        )
 
     async def run(
         self,
