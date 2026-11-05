@@ -190,9 +190,12 @@ def default_prompt_context(snapshot: Dict[str, Any], parent_id: str, prompt_conf
 
 
 def _run_iteration_worker(
-    iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
+    iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str], tags=None
 ) -> SerializableResult:
     """Run a single iteration in a worker process"""
+    if tags is not None:
+        import evoserve.tags
+        evoserve.tags.current = tags
     prompt = None
     llm_response = None
     token_usage = None
@@ -801,7 +804,7 @@ class ProcessParallelController:
         return PreparedRequest(generation_number, target_island, parent.id,
                                pickle.dumps((snapshot, [p.id for p in inspirations])))
 
-    async def _execute_request(self, request: PreparedRequest, checkpoint_callback=None) -> SerializableResult:
+    async def _execute_request(self, request: PreparedRequest, checkpoint_callback=None, tags=None) -> SerializableResult:
         """Execute a prepared request and apply normal database processing."""
         if self.shutdown_event.is_set():
             raise asyncio.CancelledError("Evolution shutdown requested")
@@ -813,7 +816,8 @@ class ProcessParallelController:
                                     target_island=target_island)
         try:
             future = self.executor.submit(
-                _run_iteration_worker, generation_number, snapshot, parent_id, list(inspirations)
+                _run_iteration_worker, generation_number, snapshot, parent_id, list(inspirations),
+                **({"tags": tags} if tags is not None else {})
             )
             pending = asyncio.wrap_future(future)
             try:
