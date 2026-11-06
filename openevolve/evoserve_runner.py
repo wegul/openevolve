@@ -101,7 +101,8 @@ class OpenEvolveSteps:
     def archive(self):
         db = self.evolution.database
         best = db.get_best_program()
-        return ArchiveState(tuple(Program(p.id, score_of(p.metrics), p.metadata.get('island'), p.iteration_found)
+        live = set().union(*db.islands) & db.programs.keys()
+        return ArchiveState(tuple(Program(p.id, score_of(p.metrics), p.metadata.get('island'), p.iteration_found, p.id in live)
                                   for p in db.programs.values()), score_of(best.metrics) if best else None)
 
     def recombine(self, attempt):
