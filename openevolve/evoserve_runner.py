@@ -38,6 +38,9 @@ def build_config(spec):
     cfg.evolution_trace.enabled = False
     cfg.database.log_prompts = False
     cfg.random_seed = cfg.database.random_seed = spec.seed
+    if os.environ.get('EVOSERVE_EVALUATION_POOL'):
+        cfg.evaluator.timeout = max(cfg.evaluator.timeout,
+                                    int(os.environ['EVOSERVE_EVALUATION_WAIT_SECONDS']))
     options = spec.algorithm
     if 'num_islands' in options:
         cfg.database.num_islands = options['num_islands']
